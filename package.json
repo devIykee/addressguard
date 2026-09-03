@@ -1,0 +1,26 @@
+{
+  "name": "addressguard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Telegraph Protocol FRAUD_DETECTION miner — address-poisoning and ENS-typosquat lookalike detection against the caller's own trusted identities.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc --noEmit && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "start": "node --experimental-strip-types src/api/server.ts",
+    "demo": "node --experimental-strip-types demo/cli.ts"
+  },
+  "dependencies": {
+    "zod": "4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.5",
+    "typescript": "5.7.3",
+    "vitest": "4.1.11"
+  }
+}
