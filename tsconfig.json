@@ -23,5 +23,12 @@
     "skipLibCheck": true,
     "isolatedModules": true
   },
-  "include": ["src/**/*.ts", "api/**/*.ts", "config/**/*.ts", "tests/**/*.ts", "demo/**/*.ts"]
+  "include": [
+    "src/**/*.ts",
+    "api/**/*.ts",
+    "config/**/*.ts",
+    "tests/**/*.ts",
+    "demo/**/*.ts",
+    "scripts/**/*.ts"
+  ]
 }

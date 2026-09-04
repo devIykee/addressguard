@@ -13,7 +13,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "start": "node --experimental-strip-types src/api/server.ts",
-    "demo": "node --experimental-strip-types demo/cli.ts"
+    "demo": "node --experimental-strip-types demo/cli.ts",
+    "verify:anchor": "node --experimental-strip-types scripts/verify-anchor.ts"
   },
   "dependencies": {
     "zod": "4.5.4"

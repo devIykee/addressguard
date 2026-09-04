@@ -29,7 +29,7 @@ POST /risk-check
 
 Tier 1 is complete: both matching strategies, the aggregation service, on-chain
 trust derivation, the HTTP layer with block-pinned evidence, the miner YAML, and
-a self-consumption demo. **122 tests pass; `tsc --noEmit` is clean** under
+a self-consumption demo. **186 tests pass; `tsc --noEmit` is clean** under
 `strict` plus `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes`.
 
 | Component | State |
@@ -71,13 +71,17 @@ reimplementation would add nothing:
 AddressGuard is the only one of the fifteen live miners on this intent that takes
 the **caller's own trusted identities** as input.
 
+Solvency stays out of scope in the sense that matters: it is not reimplemented
+here. It is **consumed** from Anchor and reported in its own field. See
+[The solvency signal](#the-solvency-signal-consuming-anchor).
+
 ---
 
 ## Quick start
 
 ```bash
 npm install
-npm test              # 122 tests
+npm test              # 186 tests
 npm run typecheck     # tsc --noEmit, strict
 npm start             # listens on $PORT, default 8080
 
@@ -108,6 +112,8 @@ append one bad string and the destination goes unchecked.
 
 ### Response
 
+Captured live, not hand-written — `npm run verify:anchor`, block 50838905:
+
 ```json
 {
   "address": "0xd9a1c3788d81257612e2581a6ea0ada244853a91",
@@ -121,13 +127,29 @@ append one bad string and the destination goes unchecked.
     "trusted_set_size": 1,
     "trust_source": "caller_supplied"
   },
+  "counterparty_solvency": {
+    "checked": true,
+    "source": "aave-v3-pool-contract",
+    "verdict": "NO_POSITION",
+    "reasoning": null,
+    "health_factor": null,
+    "checked_at_block": 50838902
+  },
+  "recommended_action": {
+    "action": "block",
+    "reason": "poisoning=high_risk:solvency=no_position:action=block"
+  },
   "evidence": {
-    "checked_at_block": 25894035,
-    "checked_at": "2026-09-03T03:17:13.227Z",
-    "canonical": "0xd9a1c3788d81257612e2581a6ea0ada244853a91|ethereum|high_risk|25894035"
+    "checked_at_block": 50838905,
+    "checked_at": "2026-09-03T20:26:01.779Z",
+    "canonical": "0xd9a1c3788d81257612e2581a6ea0ada244853a91|base|high_risk|50838905"
   }
 }
 ```
+
+`counterparty_solvency` and `recommended_action` come from consuming Anchor and
+are additive — see [The solvency signal](#the-solvency-signal-consuming-anchor).
+The three fields above them are unchanged, and unchanged by design.
 
 `risk_label` / `risk_confidence` / `risk_reason` are flat and top-level because
 that is what Telegraph's `signal_mapping` can name. Everything Tier 2 adds goes
@@ -156,6 +178,116 @@ that never ran. That case is `caution` with `risk_reason: insufficient_history`.
 
 A `safe` verdict means "not a lookalike of anything you trust" — not "this
 address is safe". No single miner can assert the latter.
+
+---
+
+## The solvency signal (consuming Anchor)
+
+No single miner can assert an address is safe, so this one stops pretending to
+and asks another. Every response carries a second opinion from
+[Anchor](https://github.com/Sammy949/anchor) — Telegraph `FRAUD_DETECTION` miner
+#49, which reads live Aave v3 lending state on Base and returns
+`ALLOW` / `RECHECK` / `BLOCK`:
+
+```json
+"counterparty_solvency": {
+  "checked": true,
+  "source": "aave-v3-pool-contract",
+  "verdict": "NO_POSITION",
+  "reasoning": null,
+  "health_factor": null,
+  "checked_at_block": 50838902
+},
+"recommended_action": {
+  "action": "block",
+  "reason": "poisoning=high_risk:solvency=no_position:action=block"
+}
+```
+
+### The three fields Telegraph reads do not move
+
+`risk_label`, `risk_confidence`, and `risk_reason` answer one question — is this
+destination a lookalike of an identity the caller trusts — and a solvency verdict
+is not evidence about that question. A `risk_reason` of `poisoning_match:...`
+produced by a health-factor lookup would be a false statement about which check
+fired.
+
+So the signal lands in its own field and the poisoning verdict is byte-identical
+whether it succeeds, fails, times out, or is absent. Seven variants are asserted
+to produce the same `risk_label`, `risk_confidence`, `risk_reason`, `detail`, and
+`evidence.canonical`. The response contract, `signal_mapping`, and the registered
+schema are all unchanged; the two new fields are additive.
+
+### The signals are orthogonal, and that is measured
+
+The obvious implementation blends the two into one score. It is wrong:
+
+| Destination | Poisoning | Anchor |
+|---|---|---|
+| WBTC 2024 lookalike | `high_risk` 0.8775 | `NO_POSITION` |
+| USDT 2025 lookalike | `high_risk` 0.8150 | `NO_POSITION` |
+| Live Aave borrower | `safe` | `ALLOW`, hf 1.57 |
+
+A poisoning address is a fresh EOA with no lending position, so averaging would
+let a healthy balance sheet dilute a lookalike match — the exact inversion this
+miner exists to prevent. `composeAdvice` is a lattice instead: take the more
+severe, and let the two mediums compound.
+
+| Poisoning | Solvency | Action |
+|---|---|---|
+| `high_risk` | anything | `block` |
+| anything | `BLOCK` | `block` |
+| `caution` | distressed | `block` |
+| `caution` | anything else | `review` |
+| `safe` | distressed | `review` |
+| `safe` | anything else | `proceed` |
+
+`caution` + distress is the only row saying more than either input did:
+`caution` already means a borderline match or no history, and an independently
+distressed counterparty is a second reason to stop. All 15 combinations are
+asserted, so a retune fails rather than silently reclassifying.
+
+### Two traps, both closed at the boundary
+
+**The chain gate.** Anchor covers Base only, and answers 200 with
+`riskLabel: NONE` for any address it finds no Base position for. Passing an
+Ethereum address through would return a confident "no lending position" that is
+true of Base and says nothing about Ethereum — a clean signal manufactured out of
+a chain mismatch. An `ethereum` request therefore reports
+`chain_not_covered:ethereum` and never makes the call.
+
+**Two shapes on one path.** Anchor serves both a wallet verdict and an LLM
+knowledge answer (`verdict: "INFO"`, `signals: null`) from the same endpoint —
+verified: `?wallet=not-an-address` returns prose. `parseAnchorResponse` requires
+`signals` to be an object, so an adapter cannot report a paragraph of LLM text as
+a lending assessment.
+
+`NO_POSITION` is also reported rather than collapsed into `ALLOW`. Anchor answers
+`ALLOW` for both a healthy borrower and an address with no position, but "nothing
+to assess" and "assessed and healthy" are different facts.
+
+### Direct HTTP, not through the node
+
+Routing through Telegraph's `/engine/v1/ask` costs $0.01 in x402 payment per call
+and, measured, adds 17-20s before the miner is even reached — past this miner's
+15s function budget. The direct call is free and, measured over 24 cache-defeating
+requests, p50 1.4s / p90 4.0s / worst 8.7s. The 5s timeout cuts that tail
+deliberately: an advisory field must not risk the request that carries it.
+
+Anchor's response is `Promise.all`-ed with the block read, so the cost is the
+slower of the two rather than their sum. That is only safe because both providers
+are contractually non-throwing.
+
+### Verifying it against the live source
+
+```bash
+npm run verify:anchor
+```
+
+Five checks against production, exit non-zero on any failure: a live borrower
+returns an assessed position, both incident lookalikes return no position, an
+Ethereum request is refused, an unreachable source degrades, and the full handler
+answers with both signals. Last run: all passed, block 50838902.
 
 ---
 
@@ -305,6 +437,8 @@ verdict instead of returning an error:
 | Explorer unavailable / rate-limited | Empty derived set → `caution` / `insufficient_history`. |
 | Trusted-set provider throws | Caught, logged, treated as empty. Still HTTP 200. |
 | One malformed `callerHistory` entry | Scored 0, logged, skipped. Others still checked. |
+| Solvency source down / slow / non-2xx | `counterparty_solvency: { checked: false, reason }`. `recommended_action` falls back to the poisoning verdict alone. Verdict unaffected. |
+| Solvency source returns an unexpected shape | Rejected as `unrecognized_response` rather than misread as a verdict. |
 | Malformed `address` or `chain` | HTTP 400 with field errors — the only 4xx a well-formed caller can trigger. |
 | Body over 64 KB | HTTP 413, response flushed before the socket closes. |
 
@@ -321,22 +455,25 @@ Full design rationale in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 ```
 src/
   domain/
-    entities/       MatchResult, RiskCheckResult, OnChainEvidence, RiskLabel
+    entities/       MatchResult, RiskCheckResult, OnChainEvidence, RiskLabel,
+                    CounterpartySolvency, RecommendedAction
     interfaces/     SimilarityStrategy, Logger, BlockProvider,
-                    TrustedSetProvider, OnChainDataProvider (T2a),
-                    EnsResolver (T2b)
+                    TrustedSetProvider, CounterpartySignalProvider,
+                    OnChainDataProvider (T2a), EnsResolver (T2b)
     services/       PoisoningDetectionService — aggregation only
+                    advice.ts — composeAdvice, pure lattice over both verdicts
   matching/
     prefix-suffix/  primary signal
     levenshtein/    corroborating signal, capped
     ens-homoglyph/  Tier 2b, empty
   verification/     Tier 2a, empty
   infrastructure/   ConsoleLogger, RpcBlockProvider,
-                    ExplorerTrustedSetProvider
+                    ExplorerTrustedSetProvider, AnchorSignalProvider
   api/              schema.ts (zod), handler.ts, response.ts,
                     app.ts (composition root), server.ts
 api/index.ts        Vercel entry — wraps the same handler
 config/             thresholds.ts, telegraph.miner.yaml
+scripts/            verify-anchor.ts — live check against the solvency source
 tests/              unit/, integration/, fixtures/
 ```
 
@@ -425,7 +562,7 @@ at.
 ## Verification
 
 ```
-122 tests, 6 files
+186 tests, 9 files
   strategy contract (shared, run per implementation)
   prefix-suffix         real incidents, detection floor, ramp monotonicity
   levenshtein           cap enforcement, derived lift bounds
@@ -434,6 +571,12 @@ at.
   trust derivation      poisonability, ERC-20 calldata, malformed rows
   v2 normalization      field remapping, error-shaped 200s
   integration           HTTP in / JSON out, evidence determinism
+  advice                all 15 label x solvency combinations, no escalation
+                        on an unavailable signal
+  anchor adapter        the two response shapes, chain gate, every failure
+                        mode degrading rather than throwing
+  solvency integration  the poisoning verdict unchanged across 7 signal
+                        variants, identical canonical string
 ```
 
 Live-verified against the running server, not only in tests:
@@ -447,9 +590,13 @@ Live-verified against the running server, not only in tests:
 | No history, no `callerAddress` | `caution` / `insufficient_history` |
 | Chain-derived, lookalike of a live counterparty | `high_risk` 0.8825, 7 identities compared |
 | 404 / 405 / bad JSON / 413 | Correct status, server survives each |
+| Live Anchor call, WBTC lookalike on Base | `high_risk` 0.8775 + `NO_POSITION`, action `block`, block 50838902 |
+| Live Anchor call, active Aave borrower | `ALLOW`, hf 1.5748, block-pinned |
+| Anchor asked about an Ethereum address | Refused: `chain_not_covered:ethereum`, no call made |
+| Anchor unreachable (port 9) | `checked: false`, poisoning verdict unchanged |
 
 `npm run demo` replays six of these end to end, blocking the mock send on a
-poisoning match.
+poisoning match. `npm run verify:anchor` runs the last four against production.
 
 ---
 

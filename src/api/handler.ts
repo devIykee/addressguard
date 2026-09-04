@@ -1,7 +1,8 @@
-import type { Chain, TrustedIdentity } from '../domain/entities/index.ts';
+import type { Chain, CounterpartySolvency, TrustedIdentity } from '../domain/entities/index.ts';
 import type { PoisoningDetectionService } from '../domain/services/poisoning-detection-service.ts';
 import type { BlockProvider } from '../domain/interfaces/block-provider.ts';
 import type { TrustedSetProvider } from '../domain/interfaces/trusted-set-provider.ts';
+import type { CounterpartySignalProvider } from '../domain/interfaces/counterparty-signal-provider.ts';
 import type { Logger } from '../domain/interfaces/logger.ts';
 import { normalizeAddress } from '../domain/address.ts';
 import { parseRiskCheckRequest } from './schema.ts';
@@ -25,17 +26,26 @@ export class RiskCheckHandler {
   private readonly blockProvider: BlockProvider;
   private readonly trustedSetProvider: TrustedSetProvider;
   private readonly logger: Logger;
+  /**
+   * Optional. The miner answers its own question with or without a second
+   * opinion, so the collaborator is optional rather than required — an operator
+   * who does not want an outbound dependency composes the app without it and
+   * every response reports `counterparty_solvency: { checked: false }`.
+   */
+  private readonly solvencyProvider: CounterpartySignalProvider | null;
 
   constructor(
     service: PoisoningDetectionService,
     blockProvider: BlockProvider,
     trustedSetProvider: TrustedSetProvider,
     logger: Logger,
+    solvencyProvider: CounterpartySignalProvider | null = null,
   ) {
     this.service = service;
     this.blockProvider = blockProvider;
     this.trustedSetProvider = trustedSetProvider;
     this.logger = logger;
+    this.solvencyProvider = solvencyProvider;
   }
 
   async handle(body: unknown): Promise<HandlerResult> {
@@ -51,6 +61,20 @@ export class RiskCheckHandler {
 
     const request = parsed.value;
     const chain: Chain = request.chain;
+
+    // Both outbound reads that do NOT depend on the trusted set are started
+    // first, without awaiting, so they overlap chain derivation instead of
+    // queueing behind it. Worst case matters here: the explorer tries two API
+    // generations at 6s each, so a hung explorer alone can spend 12s of a 15s
+    // budget, and anything awaited after it inherits that. Starting these now
+    // means the solvency call costs nothing in the slow path.
+    //
+    // Safe to float only because both are contractually non-throwing — the
+    // solvency provider catches everything and resolves to `unavailable`, the
+    // block provider resolves to `null`. A rejecting promise left unawaited here
+    // would be an unhandled rejection, which on Node kills the process.
+    const blockPromise = this.blockProvider.currentBlock(chain);
+    const solvencyPromise = this.solvencyOf(request.address, chain);
 
     const supplied = (request.callerHistory ?? []).map((identity) => ({
       identity: normalizeAddress(identity),
@@ -69,9 +93,7 @@ export class RiskCheckHandler {
 
     const trustedSet: TrustedIdentity[] = [...supplied, ...derived];
 
-    // Block height is metadata; it must never fail the check, so it is read
-    // concurrently with nothing and its failure is a null rather than a throw.
-    const block = await this.blockProvider.currentBlock(chain);
+    const [block, solvency] = await Promise.all([blockPromise, solvencyPromise]);
 
     const result = this.service.check(request.address, trustedSet);
 
@@ -83,12 +105,43 @@ export class RiskCheckHandler {
       suppliedCount: supplied.length,
       derivedCount: derived.length,
       block,
+      solvency: solvency.state,
     });
 
     return {
       status: 200,
-      body: toResponse(result, chain, block, describeTrustSource(supplied.length, derived.length)),
+      body: toResponse(
+        result,
+        chain,
+        block,
+        describeTrustSource(supplied.length, derived.length),
+        solvency,
+      ),
     };
+  }
+
+  /**
+   * Reads the counterparty solvency signal, or reports why it is absent.
+   *
+   * Wrapped in its own try/catch despite the provider being contractually
+   * non-throwing, for the same reason `deriveTrust` is: this is the component
+   * that talks to a third party, and a defect there must degrade one advisory
+   * field rather than fail a check that had already succeeded.
+   */
+  private async solvencyOf(address: string, chain: Chain): Promise<CounterpartySolvency> {
+    if (this.solvencyProvider === null) {
+      return { state: 'unavailable', reason: 'not_configured' };
+    }
+
+    try {
+      return await this.solvencyProvider.solvencyOf(normalizeAddress(address), chain);
+    } catch (error: unknown) {
+      this.logger.error('solvency provider threw; continuing without it', {
+        chain,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { state: 'unavailable', reason: 'provider_error' };
+    }
   }
 
   private async deriveTrust(
