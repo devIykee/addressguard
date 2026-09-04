@@ -70,6 +70,64 @@ export interface OnChainEvidence {
 }
 
 /**
+ * A second, independent opinion on the destination, from an external miner that
+ * answers a different question: is this counterparty financially distressed?
+ *
+ * Three states, distinguished for the same reason `PoisoningTransferEvidence`
+ * distinguishes its three: "we asked and there is nothing to assess" must not be
+ * reported as "we could not ask", and neither may be reported as clean.
+ *
+ *  - `unavailable`  — the source could not be reached, timed out, answered with
+ *    something that is not a solvency verdict, or does not cover this chain. No
+ *    claim is made in either direction.
+ *  - `no_position`  — the source answered, and the counterparty has no lending
+ *    position at all. A real answer but an uninformative one: absence of
+ *    leverage is not evidence of anything.
+ *  - `assessed`     — the source answered with a live position and a verdict.
+ */
+export type CounterpartySolvency =
+  | { readonly state: 'unavailable'; readonly reason: string }
+  | {
+      readonly state: 'no_position';
+      readonly source: string;
+      readonly checkedAtBlock: number | null;
+    }
+  | {
+      readonly state: 'assessed';
+      readonly source: string;
+      /** The upstream verdict, verbatim. Not remapped — see `composeAdvice`. */
+      readonly verdict: SolvencyVerdict;
+      readonly reasoning: string;
+      /** `null` when the position holds collateral but carries no debt. */
+      readonly healthFactor: number | null;
+      readonly checkedAtBlock: number | null;
+    };
+
+/** The upstream solvency vocabulary, kept verbatim rather than translated. */
+export type SolvencyVerdict = 'ALLOW' | 'RECHECK' | 'BLOCK';
+
+/**
+ * True when the solvency signal reports live financial distress, as opposed to
+ * reporting health, reporting no position, or being unavailable.
+ *
+ * One predicate rather than a set-membership test repeated at each call site, so
+ * "what counts as distress" is defined once.
+ */
+export function isDistressed(solvency: CounterpartySolvency): boolean {
+  return solvency.state === 'assessed' && solvency.verdict !== 'ALLOW';
+}
+
+/**
+ * What a calling agent should actually do, given both checks.
+ *
+ * Advisory and additive. It exists because an agent holding two verdicts about
+ * two different questions has to combine them somehow, and doing that once here,
+ * with the rule written down, beats every caller inventing its own. `risk_label`
+ * stays the answer to the poisoning question alone.
+ */
+export type RecommendedAction = 'proceed' | 'review' | 'block';
+
+/**
  * The full result of a risk check, before HTTP shaping.
  */
 export interface RiskCheckResult {

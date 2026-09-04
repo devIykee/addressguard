@@ -269,6 +269,77 @@ output_schema:
           type: string
           enum: [caller_supplied, chain_derived, mixed, none]
           description: Where the trusted set came from. `none` implies caution.
+    counterparty_solvency:
+      type: object
+      description: >
+        An independent second opinion on the destination, from Anchor (Telegraph
+        FRAUD_DETECTION miner #49), which reads live Aave v3 lending state on
+        Base. Reported beside the poisoning verdict, never folded into it:
+        solvency is not evidence about lookalike impersonation, so it does not
+        affect risk_label, risk_confidence, or risk_reason. checked is false when
+        the signal was unavailable, and the verdict above is identical either
+        way.
+      properties:
+        checked:
+          type: boolean
+          description: >
+            Whether the second opinion was obtained. False for an unreachable or
+            timed-out source, for a chain the source does not cover, or when no
+            provider is configured.
+        reason:
+          type: string
+          description: >
+            Present only when checked is false. Why the signal is absent, e.g.
+            unreachable:TimeoutError, http_502, chain_not_covered:ethereum.
+        source:
+          type: string
+          description: The upstream data source, e.g. aave-v3-pool-contract.
+        verdict:
+          type: string
+          enum: [ALLOW, RECHECK, BLOCK, NO_POSITION]
+          description: >
+            ALLOW — a live position with no solvency defect. RECHECK — a thin
+            collateral buffer. BLOCK — at or past the liquidation threshold.
+            NO_POSITION — the source answered and there is no lending position at
+            all, which is distinct from ALLOW: "nothing to assess" and "assessed
+            and healthy" are different facts.
+        reasoning:
+          type: [string, "null"]
+          description: >
+            The upstream plain-language explanation, verbatim. Null when there is
+            no position to explain.
+        health_factor:
+          type: [number, "null"]
+          description: >
+            Aave v3 health factor. Null when the position carries collateral but
+            no debt, so it cannot be liquidated — null rather than 0, which would
+            read as a liquidated position.
+        checked_at_block:
+          type: [integer, "null"]
+          description: Block height the upstream signal was read at.
+    recommended_action:
+      type: object
+      description: >
+        What a calling agent should do given both checks. Advisory and additive —
+        a caller that reads only risk_label gets exactly what it got before this
+        field existed.
+      properties:
+        action:
+          type: string
+          enum: [proceed, review, block]
+          description: >
+            block — a strong lookalike match, or an insolvent counterparty, or a
+            borderline match alongside a distressed one. review — a borderline
+            match, or a clean address whose counterparty is distressed. proceed —
+            a real comparison found no lookalike and nothing else fired. An
+            unavailable solvency signal never escalates the action.
+        reason:
+          type: string
+          description: >
+            Structured trace naming both inputs and the outcome, e.g.
+            "poisoning=safe:solvency=RECHECK:action=review". Kept separate from
+            risk_reason so that field never mixes a solvency term into a
+            poisoning grammar.
     evidence:
       type: object
       description: Verifiability metadata, present on every response.
@@ -289,7 +360,9 @@ output_schema:
             "address|chain|risk_label|checked_at_block" — so identical inputs
             hash identically and an answer can be reproduced rather than merely
             asserted. The timestamp is deliberately excluded, since including it
-            would make every hash unique.
+            would make every hash unique. The solvency signal is excluded too: an
+            advisory field that flaps with a third party's uptime must not change
+            the reproducibility hash of the poisoning verdict.
 
 # ── Errors: this API uses real HTTP status codes, so no status_path ──
 errors:
