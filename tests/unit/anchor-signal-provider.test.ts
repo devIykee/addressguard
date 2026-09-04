@@ -170,6 +170,105 @@ describe('AnchorSignalProvider — mapping to solvency state', () => {
   });
 });
 
+describe('AnchorSignalProvider — a hostile upstream cannot amplify through us', () => {
+  /** Builds a solvency-shaped body whose `reasoning` is `bytes` long. */
+  const oversized = (bytes: number): unknown => ({
+    ...ANCHOR_AT_RISK_SYNTHETIC,
+    reasoning: 'A'.repeat(bytes),
+  });
+
+  it('rejects a body past the cap rather than buffering it', () => {
+    // Demonstrated before the cap existed: an 8 MB `reasoning` produced a 9 MB
+    // AddressGuard response, past Vercel's 4.5 MB response limit, turning a
+    // healthy request into a 413. The upstream's real answers are ~700 bytes.
+    return withFetch(stubFetch(() => ({ body: oversized(64 * 1024) })), async () => {
+      const logger = new RecordingLogger();
+      const solvency = await build(logger).solvencyOf(ADDRESS, 'base');
+
+      expect(solvency).toEqual({ state: 'unavailable', reason: 'body_too_large' });
+      expect(logger.warnings.join()).toContain('exceeded the cap');
+    });
+  });
+
+  it('truncates a long-but-acceptable reasoning string', () => {
+    // A body can pass the byte cap and still carry one absurd field.
+    return withFetch(stubFetch(() => ({ body: oversized(8_000) })), async () => {
+      const solvency = await build().solvencyOf(ADDRESS, 'base');
+
+      expect(solvency.state).toBe('assessed');
+      if (solvency.state !== 'assessed') return;
+      expect(solvency.reasoning.length).toBeLessThan(3_000);
+      // Visibly truncated, not silently altered.
+      expect(solvency.reasoning).toContain('[truncated]');
+    });
+  });
+
+  it('truncates an oversized source label', () => {
+    const body = {
+      ...ANCHOR_ACTIVE_POSITION,
+      meta: { ...ANCHOR_ACTIVE_POSITION.meta, source: 'B'.repeat(4_000) },
+    };
+    return withFetch(stubFetch(() => ({ body })), async () => {
+      const solvency = await build().solvencyOf(ADDRESS, 'base');
+      expect(solvency.state === 'assessed' && solvency.source.length).toBeLessThan(200);
+    });
+  });
+
+  it('refuses a redirect instead of following it', () => {
+    // Left at fetch's default `follow`, a hijacked or compromised upstream turns
+    // this one pinned outbound call into an attacker-chosen one. Demonstrated: a
+    // 302 to a local service was followed and that service's body was accepted
+    // as a solvency verdict.
+    const redirecting = (() =>
+      Promise.resolve(
+        new Response(null, { status: 302, headers: { location: 'http://169.254.169.254/' } }),
+      )) as typeof globalThis.fetch;
+
+    return withFetch(redirecting, async () => {
+      const solvency = await build().solvencyOf(ADDRESS, 'base');
+      // Either the fetch layer rejects (redirect: 'error') or the 302 is a
+      // non-2xx. Both are refusals; neither follows the redirect.
+      expect(solvency.state).toBe('unavailable');
+    });
+  });
+
+  it('rejects an implausible health factor rather than reporting it', () => {
+    // `Number.isFinite` accepts -1e308. A negative health factor is not
+    // something Aave can report, and rendering it would attribute a nonsense
+    // number to a named source.
+    for (const hf of [-1e308, -1, 1e9, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const body = {
+        ...ANCHOR_AT_RISK_SYNTHETIC,
+        signals: { ...ANCHOR_AT_RISK_SYNTHETIC.signals, healthFactor: hf },
+      };
+      const parsed = parseAnchorResponse(body);
+      expect(parsed?.healthFactor, `healthFactor ${hf} must not be reported`).toBeNull();
+    }
+  });
+
+  it('keeps a plausible health factor, including the no-debt null', () => {
+    expect(parseAnchorResponse(ANCHOR_ACTIVE_POSITION)?.healthFactor).toBe(1.5083);
+    expect(parseAnchorResponse(ANCHOR_NO_POSITION)?.healthFactor).toBeNull();
+  });
+
+  it('rejects a non-integer or negative block number', () => {
+    for (const block of [-1, 1.5, Number.NaN]) {
+      const body = { ...ANCHOR_ACTIVE_POSITION, meta: { ...ANCHOR_ACTIVE_POSITION.meta, blockNumber: block } };
+      expect(parseAnchorResponse(body)?.blockNumber).toBeNull();
+    }
+  });
+
+  it('does not let upstream JSON pollute Object.prototype', () => {
+    const hostile = `{"verdict":"ALLOW","reasoning":"x","signals":{"riskLabel":"SAFE","healthFactor":1},
+      "meta":{"blockNumber":1,"source":"x"},"__proto__":{"polluted":"yes"}}`;
+
+    const parsed = parseAnchorResponse(JSON.parse(hostile));
+
+    expect(parsed?.verdict).toBe('ALLOW');
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+});
+
 describe('AnchorSignalProvider — every failure degrades, none throws', () => {
   it('reports a non-2xx as unavailable with the status', () => {
     return withFetch(stubFetch(() => ({ status: 502, body: { error: 'upstream' } })), async () => {

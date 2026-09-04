@@ -62,6 +62,20 @@ export class RiskCheckHandler {
     const request = parsed.value;
     const chain: Chain = request.chain;
 
+    // Both outbound reads that do NOT depend on the trusted set are started
+    // first, without awaiting, so they overlap chain derivation instead of
+    // queueing behind it. Worst case matters here: the explorer tries two API
+    // generations at 6s each, so a hung explorer alone can spend 12s of a 15s
+    // budget, and anything awaited after it inherits that. Starting these now
+    // means the solvency call costs nothing in the slow path.
+    //
+    // Safe to float only because both are contractually non-throwing — the
+    // solvency provider catches everything and resolves to `unavailable`, the
+    // block provider resolves to `null`. A rejecting promise left unawaited here
+    // would be an unhandled rejection, which on Node kills the process.
+    const blockPromise = this.blockProvider.currentBlock(chain);
+    const solvencyPromise = this.solvencyOf(request.address, chain);
+
     const supplied = (request.callerHistory ?? []).map((identity) => ({
       identity: normalizeAddress(identity),
       source: 'caller_supplied' as const,
@@ -79,17 +93,7 @@ export class RiskCheckHandler {
 
     const trustedSet: TrustedIdentity[] = [...supplied, ...derived];
 
-    // Both outbound reads are metadata-or-advisory, and neither depends on the
-    // other, so they run concurrently. Serially they would add up to two round
-    // trips (up to ~2s + ~5s) on a 15s function budget; concurrently the cost is
-    // the slower of the two. `Promise.all` is safe here only because both
-    // providers are contractually non-throwing — the solvency provider catches
-    // everything and resolves to `unavailable`, and the block provider resolves
-    // to `null`. If either could reject, one failure would take down the other.
-    const [block, solvency] = await Promise.all([
-      this.blockProvider.currentBlock(chain),
-      this.solvencyOf(request.address, chain),
-    ]);
+    const [block, solvency] = await Promise.all([blockPromise, solvencyPromise]);
 
     const result = this.service.check(request.address, trustedSet);
 

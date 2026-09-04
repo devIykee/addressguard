@@ -48,6 +48,30 @@ const SUPPORTED_CHAINS: readonly Chain[] = ['base'];
  */
 const TIMEOUT_MS = 5_000;
 
+/**
+ * Hard ceiling on the upstream response body.
+ *
+ * The upstream's real answers measure ~700 bytes, so 32 KB is ~45x headroom and
+ * still small enough that nothing it returns can matter to this function's own
+ * memory or response size. Without this, `reasoning` and `source` are copied
+ * verbatim from a third party into AddressGuard's own response with no bound at
+ * all: an 8 MB `reasoning` field was demonstrated producing a 9 MB AddressGuard
+ * response, past Vercel's 4.5 MB response cap, which converts a healthy request
+ * into a 413. Read the body as a bounded stream rather than trusting
+ * `content-length`, which a hostile or broken upstream can simply lie about.
+ */
+const MAX_BODY_BYTES = 32 * 1024;
+
+/**
+ * Caps on the individual strings copied out of the upstream answer.
+ *
+ * Separate from MAX_BODY_BYTES because a body can be small enough to accept and
+ * still carry one absurd field. These are display/log values, never used in a
+ * comparison, so truncating is lossless for every real answer.
+ */
+const MAX_REASONING_CHARS = 2_000;
+const MAX_SOURCE_CHARS = 128;
+
 const VERDICTS: readonly SolvencyVerdict[] = ['ALLOW', 'RECHECK', 'BLOCK'];
 
 /**
@@ -90,6 +114,12 @@ export class AnchorSignalProvider implements CounterpartySignalProvider {
       const response = await fetch(url, {
         headers: { accept: 'application/json' },
         signal: AbortSignal.timeout(this.timeoutMs),
+        // A redirect is not a valid answer from a pinned single-purpose endpoint.
+        // Left at the default `follow`, one compromised or hijacked upstream turns
+        // this trusted outbound call into an attacker-chosen one — demonstrated:
+        // a 302 to a local service was followed, and that service's body was
+        // accepted as a solvency verdict.
+        redirect: 'error',
       });
 
       if (!response.ok) {
@@ -100,10 +130,20 @@ export class AnchorSignalProvider implements CounterpartySignalProvider {
         return { state: 'unavailable', reason: `http_${response.status}` };
       }
 
-      payload = await response.json();
+      const body = await readCapped(response, MAX_BODY_BYTES);
+      if (body === null) {
+        this.logger.warn('solvency source body exceeded the cap', {
+          address: normalized,
+          capBytes: MAX_BODY_BYTES,
+        });
+        return { state: 'unavailable', reason: 'body_too_large' };
+      }
+
+      payload = JSON.parse(body);
     } catch (error: unknown) {
-      // AbortSignal.timeout raises TimeoutError; network failures raise TypeError.
-      // Both are the same outcome here, so they are reported the same way.
+      // AbortSignal.timeout raises TimeoutError; network failures raise TypeError;
+      // a refused redirect and unparseable JSON land here too. All are the same
+      // outcome — no usable second opinion — so all report the same way.
       const reason = error instanceof Error ? error.name : 'unknown';
       this.logger.warn('solvency source unreachable', {
         address: normalized,
@@ -195,19 +235,92 @@ export function parseAnchorResponse(payload: unknown): AnchorVerdict | null {
 
   return {
     verdict: verdict as SolvencyVerdict,
-    riskLabel,
-    reasoning: typeof body.reasoning === 'string' ? body.reasoning : '',
-    healthFactor: finiteOrNull(s.healthFactor),
-    blockNumber: finiteOrNull(meta.blockNumber),
-    source: typeof meta.source === 'string' ? meta.source : 'anchor',
+    riskLabel: clamp(riskLabel, MAX_SOURCE_CHARS),
+    reasoning: typeof body.reasoning === 'string' ? clamp(body.reasoning, MAX_REASONING_CHARS) : '',
+    healthFactor: plausibleHealthFactor(s.healthFactor),
+    blockNumber: plausibleBlock(meta.blockNumber),
+    source: typeof meta.source === 'string' ? clamp(meta.source, MAX_SOURCE_CHARS) : 'anchor',
   };
 }
 
 /**
- * Numbers only, and only real ones. A `null` health factor is meaningful here —
- * Aave returns uint max for a position with no debt — so it must survive as
- * `null` rather than becoming `0`, which would read as a liquidated position.
+ * Truncates an upstream string to a bound.
+ *
+ * Every string here is copied into AddressGuard's own response, so an unbounded
+ * one is an amplification vector: a hostile upstream's 8 MB `reasoning` became a
+ * 9 MB AddressGuard response in testing, past Vercel's 4.5 MB cap. The marker is
+ * kept so a truncated value is visibly truncated rather than silently altered.
  */
-function finiteOrNull(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+function clamp(value: string, maxChars: number): string {
+  return value.length <= maxChars ? value : `${value.slice(0, maxChars)}…[truncated]`;
+}
+
+/**
+ * A health factor that is a real number in a plausible range, or `null`.
+ *
+ * `Number.isFinite` alone accepts `-1e308` and `1e308`, which are finite and
+ * absurd — a negative health factor is not a thing Aave can report, and either
+ * extreme rendered into a response is a nonsense number attributed to a named
+ * source. Aave's own values sit around 1; anything past 1e6 is a defect upstream,
+ * not a position. Reported as `null` (unknown) rather than clamped to a number
+ * that was never measured.
+ *
+ * `null` still survives as `null`: Aave returns uint max for a position with no
+ * debt, and coercing that to 0 would read as a liquidated position.
+ */
+function plausibleHealthFactor(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+  if (value < 0 || value > 1e6) return null;
+  return value;
+}
+
+/** A block height that is a non-negative integer, or `null`. */
+function plausibleBlock(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) return null;
+  return value;
+}
+
+/**
+ * Reads a response body up to `maxBytes`, returning `null` if it is longer.
+ *
+ * Streams and counts rather than trusting `content-length`, which a hostile or
+ * broken upstream can understate or omit. Aborts as soon as the cap is passed, so
+ * an endless body is bounded by the cap and not only by the request timeout.
+ */
+async function readCapped(response: Response, maxBytes: number): Promise<string | null> {
+  const body = response.body;
+  if (body === null) return '';
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value === undefined) continue;
+
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  return new TextDecoder().decode(concat(chunks, total));
+}
+
+function concat(chunks: readonly Uint8Array[], total: number): Uint8Array {
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  return out;
 }
